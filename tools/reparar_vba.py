@@ -216,7 +216,12 @@ def write_cfb(tree):
 
 
 # ---------------------------------------------------------------- reparación
-def reparar(vba_bin):
+def reconstruir(vba_bin, quitar=frozenset(), transformar=None):
+    """Reconstruye el proyecto VBA solo con código fuente (sin p-code).
+
+    quitar: nombres de módulos a eliminar.
+    transformar: función (nombre_modulo, fuente) -> fuente nueva.
+    """
     o = olefile.OleFileIO(vba_bin)
     recs = parse_dir(decompress_stream(bytearray(o.openstream("VBA/dir").read())))
 
@@ -237,26 +242,28 @@ def reparar(vba_bin):
         name = next(r[1] for r in m if r[0] == 0x0019).decode(CODEPAGE)
         stream = next(r[1] for r in m if r[0] == 0x001A).decode(CODEPAGE)
         offset = struct.unpack("<I", next(r[1] for r in m if r[0] == 0x0031))[0]
-        if name in HUERFANOS:
+        if name in quitar:
             continue
         raw = o.openstream("VBA/" + stream).read()
         src = decompress_stream(bytearray(raw[offset:])).decode(CODEPAGE)
-        src = re.sub(r"(?<![\w.])ThisWorkbook\.", "Application.ThisWorkbook.", src)
+        if transformar:
+            src = transformar(name, src)
         streams[stream] = compress(src.encode(CODEPAGE))
         for r in m:
             if r[0] == 0x0031:
                 r[1] = struct.pack("<I", 0)
         keep.append(m)
-    assert {"Módulo1", "Botones", "ThisWorkbook1"} <= set(streams)
     for r in head:
         if r[0] == 0x000F:
             r[1] = struct.pack("<H", len(keep))
     new_dir = build_dir(head + [r for m in keep for r in m] + tail)
 
     project = o.openstream("PROJECT").read().decode(CODEPAGE)
-    lines = [ln for ln in project.split("\r\n")
-             if not re.match(r"^(Document=|)(%s)(/&H|=)" % "|".join(HUERFANOS), ln)]
-    project = "\r\n".join(lines).encode(CODEPAGE)
+    if quitar:
+        project = "\r\n".join(
+            ln for ln in project.split("\r\n")
+            if not re.match(r"^(Document=|)(%s)(/&H|=)" % "|".join(map(re.escape, quitar)), ln))
+    project = project.encode(CODEPAGE)
 
     wm = bytearray()
     for m in keep:
@@ -267,6 +274,12 @@ def reparar(vba_bin):
     vba = {"dir": compress(new_dir), "_VBA_PROJECT": bytes.fromhex("cc61ffff000000")}
     vba.update(streams)
     return write_cfb({"PROJECT": project, "PROJECTwm": bytes(wm), "VBA": vba})
+
+
+def reparar(vba_bin):
+    def calificar(_, src):
+        return re.sub(r"(?<![\w.])ThisWorkbook\.", "Application.ThisWorkbook.", src)
+    return reconstruir(vba_bin, frozenset(HUERFANOS), calificar)
 
 
 def main(src, dst):
